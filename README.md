@@ -15,7 +15,11 @@ The first slice provides the desktop shell and input selection workflow:
 
 The packaging action uploads values from the metadata CSV to parallel Digital Grinnell blob containers under `collection_id/`: `object_location` to `objs`, `image_small` to `smalls`, and `image_thumb` to `thumbs`. Local paths are resolved beneath the selected CollectionBuilder directory; HTTP and HTTPS locations are downloaded and streamed to Azure. An upload report is written to the selected output directory as `camp-upload-report.json`.
 
-Successful uploads are retained in `~/CAMP-data/object-url-registry.json`, keyed by normalized `objectid`. Each value contains exactly `original_objectid`, `obj_url`, `smalls_url`, and `thumbs_url`; URLs for containers that were not uploaded remain empty. For IDs beginning with `dg_`, the stored key is prefixed with `collection_id` and an underscore; `original_objectid` always preserves the CSV value.
+Successful uploads are retained in `~/CAMP-data/object-url-registry.json`, keyed by normalized `objectid`. Each value contains `original_objectid`, `obj_url`, `smalls_url`, `thumbs_url`, and `transcript`; URLs for containers that were not uploaded remain empty, and `transcript` contains the original `object_transcript` filename when present. For IDs beginning with `dg_`, the stored key is prefixed with `collection_id` and an underscore; `original_objectid` always preserves the CSV value.
+
+When `object_transcript` is populated, CAMP finds the named CSV files in `_data/transcripts` and copies the complete transcripts directory to `<output>/_data/transcripts`.
+
+CAMP also writes a transformed metadata CSV to `<output>/<collection_id>_metadata.csv`. It preserves the original columns and replaces `objectid`, `object_location`, `image_small`, `image_thumb`, and `object_transcript` with the normalized ID and values from the registry.
 
 The upload report includes warnings when a normalized object ID already exists in the registry, or when an object filename or source URL is repeated in the CSV. Each repeated value is reported only once per run; duplicates remain non-fatal.
 

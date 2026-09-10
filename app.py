@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -92,6 +93,7 @@ def empty_registry_record(original_objectid: str) -> dict[str, str]:
         "obj_url": "",
         "smalls_url": "",
         "thumbs_url": "",
+        "transcript": "",
     }
 
 
@@ -116,6 +118,8 @@ def load_object_url_registry() -> dict[str, dict[str, str]]:
             url = record.get("url")
             if container in REGISTRY_URL_FIELDS and isinstance(url, str):
                 entry[REGISTRY_URL_FIELDS[container]] = url
+            if isinstance(record.get("transcript"), str):
+                entry["transcript"] = record["transcript"]
         return migrated
     if isinstance(registry, dict):
         for object_id, value in registry.items():
@@ -133,6 +137,8 @@ def load_object_url_registry() -> dict[str, dict[str, str]]:
             for field in REGISTRY_URL_FIELDS.values():
                 if isinstance(value.get(field), str):
                     entry[field] = value[field]
+            if isinstance(value.get("transcript"), str):
+                entry["transcript"] = value["transcript"]
             migrated[object_id] = entry
     return migrated
 
@@ -215,11 +221,65 @@ def upload_objects(
     seen_blob_names = set()
     seen_filenames = set()
     seen_source_urls = set()
+    transcript_rows = []
 
     with csv_file.open(newline="", encoding="utf-8-sig") as source_csv:
         rows = csv.DictReader(source_csv)
         if "objectid" not in (rows.fieldnames or []):
             raise ValueError("The metadata CSV has no objectid column.")
+        fieldnames = rows.fieldnames or []
+
+        rows = list(rows)
+        transcript_names = {
+            (row.get("object_transcript") or "").strip()
+            for row in rows
+            if (row.get("object_transcript") or "").strip()
+        }
+        if transcript_names:
+            invalid_transcript_names = {
+                name
+                for name in transcript_names
+                if Path(name).name != name
+            }
+            if invalid_transcript_names:
+                raise ValueError(
+                    "object_transcript values must be filenames, not paths: "
+                    + ", ".join(sorted(invalid_transcript_names))
+                )
+            transcript_sources = (
+                csv_file.parent / "transcripts",
+                csv_file.parent.parent / "_data" / "transcripts",
+                collection_root / "_data" / "transcripts",
+            )
+            transcript_source_dir = next(
+                (path for path in transcript_sources if path.is_dir()), None
+            )
+            if transcript_source_dir is None:
+                raise FileNotFoundError(
+                    "No _data/transcripts directory was found for object_transcript."
+                )
+            transcript_output_dir = report_path.parent / "_data" / "transcripts"
+            shutil.copytree(
+                transcript_source_dir,
+                transcript_output_dir,
+                dirs_exist_ok=True,
+            )
+            for transcript_name in sorted(transcript_names):
+                transcript_path = transcript_source_dir / transcript_name
+                if not transcript_path.is_file():
+                    report["failed"].append(
+                        {
+                            "source": str(transcript_path),
+                            "error": "Transcript file was not found.",
+                        }
+                    )
+                    continue
+                transcript_rows.append(transcript_name)
+            logger.info(
+                "Copied %s transcript file(s) to %s",
+                len(transcript_rows),
+                transcript_output_dir,
+            )
 
         for row_number, row in enumerate(rows, start=2):
             object_id = (row.get("objectid") or "").strip()
@@ -229,6 +289,12 @@ def upload_objects(
                 )
                 continue
             normalized_id = normalized_object_id(object_id, collection_id)
+            transcript_name = (row.get("object_transcript") or "").strip()
+            if transcript_name:
+                registry_entry = object_url_registry.setdefault(
+                    normalized_id, empty_registry_record(object_id)
+                )
+                registry_entry["transcript"] = transcript_name
             if normalized_id in registered_object_ids:
                 add_warning(
                     report["warnings"],
@@ -288,6 +354,13 @@ def upload_objects(
                     blob_client = container.get_blob_client(blob_name)
                     destination = f"{container_name}/{blob_name}"
                     if blob_client.exists():
+                        registry_entry = object_url_registry.setdefault(
+                            normalized_id, empty_registry_record(object_id)
+                        )
+                        registry_entry[REGISTRY_URL_FIELDS[container_name]] = (
+                            blob_client.url
+                        )
+                        save_object_url_registry(object_url_registry)
                         add_warning(
                             report["warnings"],
                             warning_keys,
@@ -357,6 +430,31 @@ def upload_objects(
                     )
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    save_object_url_registry(object_url_registry)
+    metadata_path = report_path.parent / f"{collection_id}_metadata.csv"
+    with metadata_path.open("w", newline="", encoding="utf-8") as metadata_csv:
+        writer = csv.DictWriter(metadata_csv, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            object_id = (row.get("objectid") or "").strip()
+            output_row = dict(row)
+            if object_id:
+                normalized_id = normalized_object_id(object_id, collection_id)
+                registry_entry = object_url_registry.get(
+                    normalized_id, empty_registry_record(object_id)
+                )
+                output_row.update(
+                    {
+                        "objectid": normalized_id,
+                        "object_location": registry_entry["obj_url"],
+                        "image_small": registry_entry["smalls_url"],
+                        "image_thumb": registry_entry["thumbs_url"],
+                        "object_transcript": registry_entry["transcript"],
+                    }
+                )
+            writer.writerow(output_row)
+    report["metadata_csv"] = str(metadata_path)
+    logger.info("Wrote transformed metadata CSV to %s", metadata_path)
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     return {key: len(value) for key, value in report.items()}
 
