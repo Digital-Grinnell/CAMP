@@ -1,14 +1,330 @@
 """CAMP: CollectionBuilder Azure Metadata Packager."""
 
+import csv
+import json
+import logging
+import mimetypes
+import re
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlparse
+from urllib.request import urlopen
 
 import flet as ft
 
 
 APP_TITLE = "CAMP"
+DATA_DIR = Path.home() / "CAMP-data"
+SETTINGS_PATH = DATA_DIR / "settings.json"
+OBJECT_URL_REGISTRY_PATH = DATA_DIR / "object-url-registry.json"
+COLLECTION_ID_PATTERN = re.compile(r"[a-z_-]+")
+AZURE_BLOB_SERVICE_ENDPOINT = "https://digitalgrinnell.blob.core.windows.net/"
+AZURE_BLOB_CONTAINERS = {
+    "object_location": "objs",
+    "image_small": "smalls",
+    "image_thumb": "thumbs",
+}
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_LOG_DIR = DATA_DIR / "logfiles"
+TEMP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = TEMP_LOG_DIR / f"camp_{datetime.now():%Y%m%d_%H%M%S}.log"
+file_handler = logging.FileHandler(LOG_PATH)
+file_handler.setLevel(logging.DEBUG)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.ERROR)
+formatter = logging.Formatter(LOG_FORMAT)
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+logging.basicConfig(
+    level=logging.DEBUG,
+    handlers=[file_handler, console_handler],
+)
+logging.getLogger("flet").setLevel(logging.WARNING)
+logging.getLogger("flet_core").setLevel(logging.WARNING)
+logging.getLogger("flet_desktop").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
+def setup_working_dir_logging(working_dir: str) -> None:
+    global LOG_PATH
+    if not working_dir:
+        return
+    log_dir = Path(working_dir) / "logfiles"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    new_log_path = log_dir / f"camp_{datetime.now():%Y%m%d_%H%M%S}.log"
+    file_handler = logging.FileHandler(new_log_path)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        if isinstance(handler, logging.FileHandler):
+            handler.close()
+            root_logger.removeHandler(handler)
+    root_logger.addHandler(file_handler)
+    LOG_PATH = new_log_path
+    logger.info("Logging reconfigured to %s", new_log_path)
+
+
+def load_settings() -> dict[str, str]:
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(settings: dict[str, str]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
+
+
+def load_object_url_registry() -> list[dict[str, str]]:
+    try:
+        registry = json.loads(OBJECT_URL_REGISTRY_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(registry, list):
+        return [record for record in registry if isinstance(record, dict)]
+    if isinstance(registry, dict):
+        return [
+            {
+                "objectid": object_id,
+                "original_objectid": object_id,
+                "container": "objs",
+                "url": url,
+            }
+            for object_id, url in registry.items()
+            if isinstance(object_id, str) and isinstance(url, str)
+        ]
+    return []
+
+
+def save_object_url_registry(registry: list[dict[str, str]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_path = OBJECT_URL_REGISTRY_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(registry, indent=2) + "\n")
+    temporary_path.replace(OBJECT_URL_REGISTRY_PATH)
+
+
+def normalized_object_id(object_id: str, collection_id: str) -> str:
+    object_id = object_id.strip()
+    if object_id.startswith("dg_"):
+        return f"{collection_id}_{object_id}"
+    return object_id
+
+
+def add_warning(
+    warnings: list[dict[str, object]],
+    warning_keys: set[tuple[str, str]],
+    warning_type: str,
+    value: str,
+    message: str,
+) -> None:
+    warning_key = (warning_type, value)
+    if warning_key not in warning_keys:
+        warnings.append({"type": warning_type, "value": value, "message": message})
+        warning_keys.add(warning_key)
+
+
+def blob_suffix(source: Path, collection_root: Path) -> str:
+    relative_path = source.resolve().relative_to(collection_root.resolve()).as_posix()
+    for source_container in AZURE_BLOB_CONTAINERS.values():
+        if relative_path.startswith(f"{source_container}/"):
+            relative_path = relative_path[len(source_container) + 1 :]
+            break
+    return relative_path
+
+
+def resolve_object_path(
+    object_location: str, csv_file: Path, collection_root: Path
+) -> Path:
+    collection_root = collection_root.resolve()
+    raw_path = Path(object_location).expanduser()
+    candidates = (
+        raw_path if raw_path.is_absolute() else collection_root / raw_path,
+        csv_file.parent / raw_path,
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(collection_root)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(object_location)
+
+
+def upload_objects(
+    csv_file: Path,
+    collection_root: Path,
+    collection_id: str,
+    report_path: Path,
+    status_callback,
+) -> dict[str, int]:
+    from azure.identity import DefaultAzureCredential
+    from azure.storage.blob import BlobServiceClient, ContentSettings
+
+    blob_service = BlobServiceClient(
+        account_url=AZURE_BLOB_SERVICE_ENDPOINT,
+        credential=DefaultAzureCredential(),
+    )
+    report = {"uploaded": [], "failed": [], "warnings": []}
+    object_url_registry = load_object_url_registry()
+    registered_object_ids = {
+        record.get("objectid")
+        for record in object_url_registry
+        if record.get("objectid")
+    }
+    warning_keys = set()
+    seen_blob_names = set()
+    seen_filenames = set()
+    seen_source_urls = set()
+
+    with csv_file.open(newline="", encoding="utf-8-sig") as source_csv:
+        rows = csv.DictReader(source_csv)
+        if "objectid" not in (rows.fieldnames or []):
+            raise ValueError("The metadata CSV has no objectid column.")
+
+        for row_number, row in enumerate(rows, start=2):
+            object_id = (row.get("objectid") or "").strip()
+            if not object_id:
+                report["failed"].append(
+                    {"row": row_number, "error": "Missing objectid."}
+                )
+                continue
+            normalized_id = normalized_object_id(object_id, collection_id)
+            if normalized_id in registered_object_ids:
+                add_warning(
+                    report["warnings"],
+                    warning_keys,
+                    "duplicate_objectid",
+                    normalized_id,
+                    f"Normalized objectid already exists in the registry: {normalized_id}",
+                )
+            for source_column, container_name in AZURE_BLOB_CONTAINERS.items():
+                source_location = (row.get(source_column) or "").strip()
+                if not source_location:
+                    continue
+                container = blob_service.get_container_client(container_name)
+                parsed_location = urlparse(source_location)
+                is_remote = parsed_location.scheme in {"http", "https"}
+                if is_remote:
+                    if source_location in seen_source_urls:
+                        add_warning(
+                            report["warnings"],
+                            warning_keys,
+                            "duplicate_url",
+                            source_location,
+                            f"Source URL appears more than once: {source_location}",
+                        )
+                    seen_source_urls.add(source_location)
+                    filename = Path(unquote(parsed_location.path)).name
+                    source = source_location
+                else:
+                    source_path = resolve_object_path(
+                        source_location, csv_file, collection_root
+                    )
+                    filename = blob_suffix(source_path, collection_root)
+                    source = str(source_path)
+
+                filename_key = (container_name, filename)
+                if filename_key in seen_filenames:
+                    add_warning(
+                        report["warnings"],
+                        warning_keys,
+                        "duplicate_filename",
+                        f"{container_name}/{filename}",
+                        f"Object filename appears more than once in {container_name}: {filename}",
+                    )
+                seen_filenames.add(filename_key)
+                blob_name = f"{collection_id}/{filename}"
+                blob_key = (container_name, blob_name)
+                if blob_key in seen_blob_names:
+                    continue
+                seen_blob_names.add(blob_key)
+                content_type = mimetypes.guess_type(filename)[0]
+                content_settings = (
+                    ContentSettings(content_type=content_type)
+                    if content_type
+                    else None
+                )
+                try:
+                    status_callback(f"Uploading {container_name}/{filename}...")
+                    logger.info(
+                        "Uploading row %s to %s/%s from %s",
+                        row_number,
+                        container_name,
+                        blob_name,
+                        source,
+                    )
+                    if is_remote:
+                        with urlopen(source_location) as remote_file:
+                            container.upload_blob(
+                                name=blob_name,
+                                data=remote_file,
+                                overwrite=True,
+                                content_settings=content_settings,
+                            )
+                    else:
+                        with source_path.open("rb") as local_file:
+                            container.upload_blob(
+                                name=blob_name,
+                                data=local_file,
+                                overwrite=True,
+                                content_settings=content_settings,
+                            )
+                    blob_url = container.get_blob_client(blob_name).url
+                    object_url_registry.append(
+                        {
+                            "objectid": normalized_id,
+                            "original_objectid": object_id,
+                            "container": container_name,
+                            "url": blob_url,
+                        }
+                    )
+                    save_object_url_registry(object_url_registry)
+                    report["uploaded"].append(
+                        {
+                            "row": row_number,
+                            "source": source,
+                            "container": container_name,
+                            "blob": blob_name,
+                            "objectid": normalized_id,
+                            "original_objectid": object_id,
+                            "url": blob_url,
+                        }
+                    )
+                    logger.info("Uploaded %s", blob_url)
+                except Exception as error:
+                    logger.exception(
+                        "Upload failed for row %s to %s/%s",
+                        row_number,
+                        container_name,
+                        blob_name,
+                    )
+                    report["failed"].append(
+                        {
+                            "row": row_number,
+                            "source": source,
+                            "container": container_name,
+                            "blob": blob_name,
+                            "error": str(error),
+                        }
+                    )
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
+    return {key: len(value) for key, value in report.items()}
 
 
 def main(page: ft.Page) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    settings = load_settings()
+    setup_working_dir_logging(settings.get("output_path", ""))
+    logger.info("CAMP application started")
+
     page.title = f"{APP_TITLE} | CollectionBuilder Azure Metadata Packager"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 28
@@ -21,17 +337,28 @@ def main(page: ft.Page) -> None:
         hint_text="Choose the CollectionBuilder metadata CSV",
         read_only=True,
         expand=True,
+        value=settings.get("csv_path", ""),
     )
     collection_path = ft.TextField(
         label="CollectionBuilder files",
         hint_text="Choose the deployment or local collection directory",
         read_only=True,
         expand=True,
+        value=settings.get("collection_path", ""),
     )
     output_path = ft.TextField(
         label="Azure package output",
         hint_text="Choose where the prepared package will be written",
         read_only=True,
+        expand=True,
+        value=settings.get("output_path", str(DATA_DIR)),
+    )
+    collection_id = ft.TextField(
+        label="Collection ID",
+        hint_text="4-20 lowercase characters, underscores, or hyphens",
+        max_length=20,
+        input_filter=ft.InputFilter(regex_string=r"[a-z_-]", allow=True),
+        value=settings.get("collection_id", ""),
         expand=True,
     )
     status = ft.Text("Ready for input", color=ft.Colors.BLUE_GREY_700)
@@ -43,33 +370,90 @@ def main(page: ft.Page) -> None:
 
     def update_package_state() -> None:
         package_button.disabled = not all(
-            (csv_path.value, collection_path.value, output_path.value)
+            (
+                csv_path.value,
+                collection_path.value,
+                output_path.value,
+                collection_id_is_valid(),
+            )
         )
         page.update()
+
+    def collection_id_is_valid() -> bool:
+        value = collection_id.value or ""
+        return 4 <= len(value) <= 20 and bool(
+            COLLECTION_ID_PATTERN.fullmatch(value)
+        )
+
+    def validate_collection_id(_: ft.ControlEvent | None = None) -> None:
+        value = collection_id.value or ""
+        collection_id.error_text = (
+            None
+            if not value or collection_id_is_valid()
+            else "Use 4-20 lowercase letters, underscores, or hyphens."
+        )
+        persist_inputs()
+        update_package_state()
+
+    def persist_inputs() -> None:
+        save_settings(
+            {
+                "csv_path": csv_path.value or "",
+                "collection_path": collection_path.value or "",
+                "output_path": output_path.value or str(DATA_DIR),
+                "collection_id": collection_id.value or "",
+            }
+        )
 
     def choose_csv(event: ft.FilePickerResultEvent) -> None:
         if event.files:
             csv_path.value = event.files[0].path
             status.value = "Metadata CSV selected."
+            persist_inputs()
         update_package_state()
 
     def choose_collection(event: ft.FilePickerResultEvent) -> None:
         if event.path:
             collection_path.value = event.path
             status.value = "CollectionBuilder directory selected."
+            persist_inputs()
         update_package_state()
 
     def choose_output(event: ft.FilePickerResultEvent) -> None:
         if event.path:
             output_path.value = event.path
+            setup_working_dir_logging(event.path)
             status.value = "Output directory selected."
+            persist_inputs()
         update_package_state()
 
     def prepare_package(_: ft.ControlEvent) -> None:
-        status.value = (
-            "Packaging engine not connected yet. Inputs are ready for the next step."
-        )
-        status.color = ft.Colors.ORANGE_800
+        try:
+            counts = upload_objects(
+                csv_file=Path(csv_path.value),
+                collection_root=Path(collection_path.value),
+                collection_id=collection_id.value,
+                report_path=Path(output_path.value) / "camp-upload-report.json",
+                status_callback=lambda message: set_status(message),
+            )
+            status.value = (
+                f"Uploaded {counts['uploaded']} object(s); "
+                f"{counts['failed']} failed; "
+                f"{counts['warnings']} warning(s)."
+            )
+            status.color = (
+                ft.Colors.GREEN_800
+                if counts["failed"] == 0 and counts["warnings"] == 0
+                else ft.Colors.ORANGE_800
+            )
+        except Exception as error:
+            status.value = f"Upload failed: {error}"
+            status.color = ft.Colors.RED_800
+        page.update()
+
+    def set_status(message: str) -> None:
+        status.value = message
+        status.color = ft.Colors.BLUE_GREY_700
         page.update()
 
     csv_picker = ft.FilePicker(on_result=choose_csv)
@@ -78,6 +462,7 @@ def main(page: ft.Page) -> None:
     page.overlay.extend([csv_picker, collection_picker, output_picker])
 
     package_button.on_click = prepare_package
+    collection_id.on_change = validate_collection_id
 
     def pick_csv(_: ft.ControlEvent) -> None:
         csv_picker.pick_files(
@@ -123,6 +508,7 @@ def main(page: ft.Page) -> None:
                     ],
                     spacing=12,
                 ),
+                collection_id,
                 ft.Container(height=12),
                 ft.Row(
                     [package_button],
@@ -148,6 +534,7 @@ def main(page: ft.Page) -> None:
             spacing=18,
         )
     )
+    validate_collection_id()
 
 
 if __name__ == "__main__":
