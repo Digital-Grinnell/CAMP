@@ -15,9 +15,11 @@ The first slice provides the desktop shell and input selection workflow:
 
 The packaging action uploads values from the metadata CSV to parallel Digital Grinnell blob containers under `collection_id/`: `object_location` to `objs`, `image_small` to `smalls`, and `image_thumb` to `thumbs`. Local paths are resolved beneath the selected CollectionBuilder directory; HTTP and HTTPS locations are downloaded and streamed to Azure. An upload report is written to the selected output directory as `camp-upload-report.json`.
 
-Successful uploads are retained in `~/CAMP-data/object-url-registry.json`. Each record contains `objectid`, `original_objectid`, `container`, and `url`. For IDs beginning with `dg_`, the stored `objectid` is prefixed with `collection_id` and an underscore; `original_objectid` always preserves the CSV value.
+Successful uploads are retained in `~/CAMP-data/object-url-registry.json`, keyed by normalized `objectid`. Each value contains exactly `original_objectid`, `obj_url`, `smalls_url`, and `thumbs_url`; URLs for containers that were not uploaded remain empty. For IDs beginning with `dg_`, the stored key is prefixed with `collection_id` and an underscore; `original_objectid` always preserves the CSV value.
 
 The upload report includes warnings when a normalized object ID already exists in the registry, or when an object filename or source URL is repeated in the CSV. Each repeated value is reported only once per run; duplicates remain non-fatal.
+
+Before reading or downloading a source file, CAMP checks whether the destination blob already exists. Existing blobs are skipped and reported as `existing_blob` warnings so repeated runs do not spend resources copying them again.
 
 CAMP writes timestamped DEBUG logs to `~/CAMP-data/logfiles` at startup and reconfigures logging to `<output directory>/logfiles` when an output directory is selected. ERROR-level messages are also sent to the console.
 

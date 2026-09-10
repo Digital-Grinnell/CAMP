@@ -79,28 +79,65 @@ def save_settings(settings: dict[str, str]) -> None:
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
 
 
-def load_object_url_registry() -> list[dict[str, str]]:
+REGISTRY_URL_FIELDS = {
+    "objs": "obj_url",
+    "smalls": "smalls_url",
+    "thumbs": "thumbs_url",
+}
+
+
+def empty_registry_record(original_objectid: str) -> dict[str, str]:
+    return {
+        "original_objectid": original_objectid,
+        "obj_url": "",
+        "smalls_url": "",
+        "thumbs_url": "",
+    }
+
+
+def load_object_url_registry() -> dict[str, dict[str, str]]:
     try:
         registry = json.loads(OBJECT_URL_REGISTRY_PATH.read_text())
     except (OSError, json.JSONDecodeError):
-        return []
+        return {}
+    migrated: dict[str, dict[str, str]] = {}
     if isinstance(registry, list):
-        return [record for record in registry if isinstance(record, dict)]
+        for record in registry:
+            if not isinstance(record, dict):
+                continue
+            object_id = record.get("objectid")
+            if not isinstance(object_id, str) or not object_id:
+                continue
+            entry = migrated.setdefault(
+                object_id,
+                empty_registry_record(record.get("original_objectid", object_id)),
+            )
+            container = record.get("container")
+            url = record.get("url")
+            if container in REGISTRY_URL_FIELDS and isinstance(url, str):
+                entry[REGISTRY_URL_FIELDS[container]] = url
+        return migrated
     if isinstance(registry, dict):
-        return [
-            {
-                "objectid": object_id,
-                "original_objectid": object_id,
-                "container": "objs",
-                "url": url,
-            }
-            for object_id, url in registry.items()
-            if isinstance(object_id, str) and isinstance(url, str)
-        ]
-    return []
+        for object_id, value in registry.items():
+            if not isinstance(object_id, str):
+                continue
+            if isinstance(value, str):
+                migrated[object_id] = empty_registry_record(object_id)
+                migrated[object_id]["obj_url"] = value
+                continue
+            if not isinstance(value, dict):
+                continue
+            entry = empty_registry_record(
+                value.get("original_objectid", object_id)
+            )
+            for field in REGISTRY_URL_FIELDS.values():
+                if isinstance(value.get(field), str):
+                    entry[field] = value[field]
+            migrated[object_id] = entry
+    return migrated
 
 
-def save_object_url_registry(registry: list[dict[str, str]]) -> None:
+def save_object_url_registry(registry: dict[str, dict[str, str]]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     temporary_path = OBJECT_URL_REGISTRY_PATH.with_suffix(".tmp")
     temporary_path.write_text(json.dumps(registry, indent=2) + "\n")
@@ -172,11 +209,8 @@ def upload_objects(
     )
     report = {"uploaded": [], "failed": [], "warnings": []}
     object_url_registry = load_object_url_registry()
-    registered_object_ids = {
-        record.get("objectid")
-        for record in object_url_registry
-        if record.get("objectid")
-    }
+    save_object_url_registry(object_url_registry)
+    registered_object_ids = set(object_url_registry)
     warning_keys = set()
     seen_blob_names = set()
     seen_filenames = set()
@@ -251,6 +285,18 @@ def upload_objects(
                     else None
                 )
                 try:
+                    blob_client = container.get_blob_client(blob_name)
+                    destination = f"{container_name}/{blob_name}"
+                    if blob_client.exists():
+                        add_warning(
+                            report["warnings"],
+                            warning_keys,
+                            "existing_blob",
+                            destination,
+                            f"Destination blob already exists; skipped: {destination}",
+                        )
+                        logger.warning("Skipping existing blob %s", destination)
+                        continue
                     status_callback(f"Uploading {container_name}/{filename}...")
                     logger.info(
                         "Uploading row %s to %s/%s from %s",
@@ -275,15 +321,11 @@ def upload_objects(
                                 overwrite=True,
                                 content_settings=content_settings,
                             )
-                    blob_url = container.get_blob_client(blob_name).url
-                    object_url_registry.append(
-                        {
-                            "objectid": normalized_id,
-                            "original_objectid": object_id,
-                            "container": container_name,
-                            "url": blob_url,
-                        }
+                    blob_url = blob_client.url
+                    registry_entry = object_url_registry.setdefault(
+                        normalized_id, empty_registry_record(object_id)
                     )
+                    registry_entry[REGISTRY_URL_FIELDS[container_name]] = blob_url
                     save_object_url_registry(object_url_registry)
                     report["uploaded"].append(
                         {
