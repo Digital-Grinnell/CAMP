@@ -25,6 +25,7 @@ AZURE_BLOB_CONTAINERS = {
     "image_small": "smalls",
     "image_thumb": "thumbs",
 }
+OPTIONAL_IMAGE_CONTAINERS = {"smalls", "thumbs"}
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -323,9 +324,19 @@ def upload_objects(
                     filename = Path(unquote(parsed_location.path)).name
                     source = source_location
                 else:
-                    source_path = resolve_object_path(
-                        source_location, csv_file, collection_root
-                    )
+                    try:
+                        source_path = resolve_object_path(
+                            source_location, csv_file, collection_root
+                        )
+                    except FileNotFoundError:
+                        if container_name in OPTIONAL_IMAGE_CONTAINERS:
+                            logger.info(
+                                "Skipping missing optional image for row %s: %s",
+                                row_number,
+                                source_location,
+                            )
+                            continue
+                        raise
                     filename = blob_suffix(source_path, collection_root)
                     source = str(source_path)
 
