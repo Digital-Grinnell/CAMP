@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import re
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -146,9 +147,17 @@ def load_object_url_registry() -> dict[str, dict[str, str]]:
 
 def save_object_url_registry(registry: dict[str, dict[str, str]]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temporary_path = OBJECT_URL_REGISTRY_PATH.with_suffix(".tmp")
-    temporary_path.write_text(json.dumps(registry, indent=2) + "\n")
-    temporary_path.replace(OBJECT_URL_REGISTRY_PATH)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        dir=DATA_DIR,
+        delete=False,
+        encoding="utf-8",
+        prefix="object-url-registry-",
+        suffix=".tmp",
+    ) as temp_file:
+        temp_file.write(json.dumps(registry, indent=2) + "\n")
+        temp_path = Path(temp_file.name)
+    temp_path.replace(OBJECT_URL_REGISTRY_PATH)
 
 
 def normalized_object_id(object_id: str, collection_id: str) -> str:
@@ -219,7 +228,7 @@ def upload_objects(
     save_object_url_registry(object_url_registry)
     registered_object_ids = set(object_url_registry)
     warning_keys = set()
-    seen_blob_names = set()
+    known_blob_urls = {}
     seen_filenames = set()
     seen_source_urls = set()
     transcript_rows = []
@@ -352,9 +361,15 @@ def upload_objects(
                 seen_filenames.add(filename_key)
                 blob_name = f"{collection_id}/{filename}"
                 blob_key = (container_name, blob_name)
-                if blob_key in seen_blob_names:
+                if blob_key in known_blob_urls:
+                    blob_url = known_blob_urls[blob_key]
+                    registry_entry = object_url_registry.setdefault(
+                        normalized_id, empty_registry_record(object_id)
+                    )
+                    registry_entry[REGISTRY_URL_FIELDS[container_name]] = blob_url
+                    save_object_url_registry(object_url_registry)
                     continue
-                seen_blob_names.add(blob_key)
+
                 content_type = mimetypes.guess_type(filename)[0]
                 content_settings = (
                     ContentSettings(content_type=content_type)
@@ -365,11 +380,13 @@ def upload_objects(
                     blob_client = container.get_blob_client(blob_name)
                     destination = f"{container_name}/{blob_name}"
                     if blob_client.exists():
+                        blob_url = blob_client.url
+                        known_blob_urls[blob_key] = blob_url
                         registry_entry = object_url_registry.setdefault(
                             normalized_id, empty_registry_record(object_id)
                         )
                         registry_entry[REGISTRY_URL_FIELDS[container_name]] = (
-                            blob_client.url
+                            blob_url
                         )
                         save_object_url_registry(object_url_registry)
                         add_warning(
@@ -406,6 +423,7 @@ def upload_objects(
                                 content_settings=content_settings,
                             )
                     blob_url = blob_client.url
+                    known_blob_urls[blob_key] = blob_url
                     registry_entry = object_url_registry.setdefault(
                         normalized_id, empty_registry_record(object_id)
                     )
