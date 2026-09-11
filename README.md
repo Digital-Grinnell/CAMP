@@ -13,7 +13,7 @@ The first slice provides the desktop shell and input selection workflow:
 - See whether the required inputs are present.
 - Reopen CAMP with the previously selected inputs restored from `~/CAMP-data/settings.json`.
 
-The packaging action uploads values from the metadata CSV to parallel Digital Grinnell blob containers under `collection_id/`: `object_location` to `objs`, `image_small` to `smalls`, and `image_thumb` to `thumbs`. Local paths are resolved beneath the selected CollectionBuilder directory; HTTP and HTTPS locations are downloaded and streamed to Azure. An upload report is written to the selected output directory as `camp-upload-report.json`.
+The packaging action uploads values from the metadata CSV to parallel Digital Grinnell blob containers under `collection_id/`: `object_location` to `objs`, `image_small` to `smalls`, and `image_thumb` to `thumbs`. Image-only records are supported, including CSVs that omit `object_location` entirely. Local paths are resolved beneath the selected CollectionBuilder directory; HTTP and HTTPS locations are downloaded and streamed to Azure. An upload report is written to the selected output directory as `camp-upload-report.json`.
 
 Successful uploads are retained in `~/CAMP-data/object-url-registry.json`, keyed by normalized `objectid`. Each value contains `original_objectid`, `obj_url`, `smalls_url`, `thumbs_url`, and `transcript`; URLs for containers that were not uploaded remain empty, and `transcript` contains the original `object_transcript` filename when present. For IDs beginning with `dg_`, the stored key is prefixed with `collection_id` and an underscore; `original_objectid` always preserves the CSV value.
 

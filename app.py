@@ -454,13 +454,18 @@ def upload_objects(
                 registry_entry = object_url_registry.get(
                     normalized_id, empty_registry_record(object_id)
                 )
+                transformed_fields = {
+                    "objectid": normalized_id,
+                    "object_location": registry_entry["obj_url"],
+                    "image_small": registry_entry["smalls_url"],
+                    "image_thumb": registry_entry["thumbs_url"],
+                    "object_transcript": registry_entry["transcript"],
+                }
                 output_row.update(
                     {
-                        "objectid": normalized_id,
-                        "object_location": registry_entry["obj_url"],
-                        "image_small": registry_entry["smalls_url"],
-                        "image_thumb": registry_entry["thumbs_url"],
-                        "object_transcript": registry_entry["transcript"],
+                        field: value
+                        for field, value in transformed_fields.items()
+                        if field in fieldnames
                     }
                 )
             writer.writerow(output_row)
